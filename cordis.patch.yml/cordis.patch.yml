@@ -1,0 +1,14 @@
+# @RCYD857/dsh-pdf-patched bundle patch: inserts the PDF-parsing plugin row into
+# the web profile roster. Applied as a profile bundle layer (the `dsh.bundle.patch`
+# manifest field); install with
+# `dsh plugin --profile web add github:RCYD857/857-dsh-pdf-patched`
+# and append "@RCYD857/dsh-pdf-patched" to dsh.profile.bundles in the profile package.json.
+#
+# The row is a bare plugin by package name: the node half (exports ".")
+# runs in the host process and registers the model-facing pdf_info /
+# pdf_extract_text / pdf_render_page tools plus an agent announcement.
+# No browser half (no `dsh.client` declaration), so nothing is served
+# to the web GUI.
+- insert:
+    - id: pdf
+      name: '@RCYD857/dsh-pdf-patched'

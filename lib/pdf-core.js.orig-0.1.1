@@ -1,0 +1,787 @@
+// pdf-core.js — dsh-pdf 插件引擎: PDF 信息 / 文本提取 / 页面渲染
+// 自包含: 仅依赖插件自带 node_modules 里的 pdfjs-dist 与 @napi-rs/canvas。
+// 渲染引擎自动选择:
+//   - 所有字体均已内嵌 -> pdfjs 引擎 (标准渲染, 完整支持内嵌子集字体)
+//   - 存在未内嵌字体  -> sysfont 引擎 (自研内容流渲染 + 系统字体画文字,
+//     适配嘉立创EDA等未内嵌字体导出; 假设 Type0 字体 CID == Unicode)
+import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
+import { pathToFileURL, fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const PKG_ROOT = path.dirname(HERE);
+const PDFJS_URL = pathToFileURL(path.join(PKG_ROOT, 'node_modules', 'pdfjs-dist', 'legacy', 'build', 'pdf.mjs')).href;
+const CMAPS_DIR = path.join(PKG_ROOT, 'node_modules', 'pdfjs-dist', 'cmaps') + path.sep;
+const STDFONTS_DIR = path.join(PKG_ROOT, 'node_modules', 'pdfjs-dist', 'standard_fonts') + path.sep;
+
+const pdfjs = await import(PDFJS_URL);
+const canvasMod = await import('@napi-rs/canvas');
+const { createCanvas, GlobalFonts } = canvasMod;
+
+// ---------- 系统字体 ----------
+const FONT_FILES = [
+  'C:/Windows/Fonts/simsun.ttc',
+  'C:/Windows/Fonts/simhei.ttf',
+  'C:/Windows/Fonts/msyh.ttc',
+  'C:/Windows/Fonts/simkai.ttf',
+  'C:/Windows/Fonts/simfang.ttf',
+  'C:/Windows/Fonts/arial.ttf',
+  'C:/Windows/Fonts/times.ttf',
+  'C:/Windows/Fonts/cour.ttf',
+];
+const REGISTERED = new Set();
+if (GlobalFonts) {
+  for (const f of FONT_FILES) {
+    if (!fs.existsSync(f)) continue;
+    try {
+      for (const fam of GlobalFonts.registerFromPath(f)) {
+        if (fam && fam.family) REGISTERED.add(fam.family);
+      }
+    } catch { /* 跳过 */ }
+  }
+}
+
+function pdfFontToFamily(baseFont) {
+  const n = (baseFont || '').replace(/[+#,]/g, ' ').trim().toLowerCase();
+  const map = [
+    [/simsun|song|宋体|sun/, ['SimSun', '宋体']],
+    [/simhei|hei|黑体/, ['SimHei', '黑体']],
+    [/yahei|microsoft yahei|msyh/, ['Microsoft YaHei', '微软雅黑']],
+    [/kaiti|kai/, ['KaiTi', '楷体']],
+    [/fangsong/, ['FangSong', '仿宋']],
+    [/times|serif/, ['Times New Roman']],
+    [/courier|mono/, ['Courier New']],
+    [/arial|helvetica|sans/, ['Arial']],
+  ];
+  for (const [re, candidates] of map) {
+    if (re.test(n)) {
+      for (const c of candidates) {
+        for (const reg of REGISTERED) {
+          if (reg.toLowerCase() === c.toLowerCase() || reg.toLowerCase().startsWith(c.toLowerCase() + ' ')) return reg;
+        }
+      }
+      return candidates[0];
+    }
+  }
+  return 'Arial';
+}
+
+// ---------- pdfjs 工厂 (Node 24 全局 fetch 不支持 file://) ----------
+class FsCMapReaderFactory {
+  constructor({ baseUrl, isCompressed = true }) {
+    this.baseUrl = baseUrl;
+    this.isCompressed = isCompressed;
+  }
+  async fetch({ name }) {
+    const file = this.baseUrl + name + (this.isCompressed ? '.bcmap' : '');
+    return new Uint8Array(await fs.promises.readFile(file));
+  }
+}
+class FsStandardFontDataFactory {
+  constructor({ baseUrl }) { this.baseUrl = baseUrl; }
+  async fetch({ filename }) {
+    return new Uint8Array(await fs.promises.readFile(this.baseUrl + filename));
+  }
+}
+class NodeCanvasFactory {
+  create(width, height) {
+    const canvas = createCanvas(width, height);
+    const context = canvas.getContext('2d');
+    return { canvas, context };
+  }
+  reset(canvasAndContext, width, height) {
+    canvasAndContext.canvas.width = width;
+    canvasAndContext.canvas.height = height;
+  }
+  destroy(canvasAndContext) {
+    canvasAndContext.canvas.width = 0;
+    canvasAndContext.canvas.height = 0;
+  }
+}
+
+// ---------- 轻量 PDF 对象解析 (用于字体扫描与 sysfont 渲染) ----------
+function parsePdfObjects(buf) {
+  const ascii = buf.toString('latin1');
+  const objs = new Map();
+  const re = /(\d+)\s+(\d+)\s+obj\b/g;
+  let m;
+  while ((m = re.exec(ascii)) !== null) objs.set(parseInt(m[1], 10), { num: parseInt(m[1], 10), gen: parseInt(m[2], 10), start: m.index });
+  const starts = [...objs.values()].map(o => o.start).sort((a, b) => a - b);
+  for (const o of objs.values()) {
+    const next = starts.find(s => s > o.start);
+    const end = next !== undefined ? next : ascii.indexOf('%%EOF', o.start);
+    o.raw = ascii.slice(o.start, end === -1 ? undefined : end);
+  }
+  const objBody = (o) => o.raw.slice(o.raw.indexOf('obj') + 3);
+  function parseDict(raw, startIdx) {
+    let i = startIdx;
+    const LIMIT = raw.length;
+    const skipWS = () => { while (i < LIMIT && /\s/.test(raw[i])) i++; };
+    const parseValue = (depth) => {
+      if (depth > 30) return null;
+      skipWS();
+      if (i >= LIMIT) return null;
+      if (raw[i] === '/') {
+        let j = i + 1;
+        while (j < LIMIT && !/[\s/<>\[\](){}]/.test(raw[j])) j++;
+        const name = raw.slice(i + 1, j);
+        i = j;
+        return name;
+      }
+      if (raw[i] === '(') {
+        let j = i + 1, depth2 = 1, out = '';
+        while (j < LIMIT && depth2 > 0) {
+          const c = raw[j];
+          if (c === '\\') {
+            const n = raw[j + 1];
+            if (n === 'n') out += '\n'; else if (n === 'r') out += '\r'; else if (n === 't') out += '\t';
+            else if (n === '(') out += '('; else if (n === ')') out += ')'; else if (n === '\\') out += '\\';
+            else if (n >= '0' && n <= '7') { out += String.fromCharCode(parseInt(raw.slice(j + 1, j + 4), 8)); j += 2; }
+            else out += n;
+            j += 2;
+          } else if (c === '(') { depth2++; out += c; j++; }
+          else if (c === ')') { depth2--; if (depth2 > 0) out += c; j++; }
+          else { out += c; j++; }
+        }
+        i = j;
+        return out;
+      }
+      if (raw[i] === '<') {
+        if (raw[i + 1] === '<') {
+          let j = i + 2, d = 1, out = '';
+          while (j < LIMIT && d > 0) {
+            if (raw[j] === '<' && raw[j + 1] === '<') { d++; out += '<<'; j += 2; }
+            else if (raw[j] === '>' && raw[j + 1] === '>') { d--; if (d > 0) out += '>>'; j += 2; }
+            else { out += raw[j]; j++; }
+          }
+          i = j;
+          return parseDict(out, 0);
+        }
+        let j = i + 1, out = '';
+        while (j < LIMIT && raw[j] !== '>') { out += raw[j]; j++; }
+        i = j + 1;
+        return { __hex: out };
+      }
+      if (raw[i] === '[') {
+        i++;
+        const arr = [];
+        let guard = 0;
+        while (guard++ < 10000) {
+          skipWS();
+          if (i >= LIMIT) break;
+          if (raw[i] === ']') { i++; break; }
+          arr.push(parseValue(depth + 1));
+        }
+        return arr;
+      }
+      if (raw.startsWith('true', i)) { i += 4; return true; }
+      if (raw.startsWith('false', i)) { i += 5; return false; }
+      if (raw.startsWith('null', i)) { i += 4; return null; }
+      let j = i;
+      while (j < LIMIT && /[-+0-9.eE]/.test(raw[j])) j++;
+      if (j > i) {
+        const start = i;
+        i = j;
+        const n = parseFloat(raw.slice(start, j));
+        return Number.isFinite(n) ? n : n;
+      }
+      let k = i;
+      while (k < LIMIT && !/\s/.test(raw[k])) k++;
+      const tok = raw.slice(i, k);
+      i = Math.max(k, i + 1);
+      return tok;
+    };
+    skipWS();
+    if (raw[i] === '<' && raw[i + 1] === '<') i += 2;
+    const dict = {};
+    let guard = 0;
+    while (i < LIMIT && guard++ < 5000) {
+      skipWS();
+      if (i >= LIMIT) break;
+      if (raw[i] === '>' && raw[i + 1] === '>') { i += 2; break; }
+      if (raw[i] === '/') {
+        const name = parseValue(0);
+        const val = parseValue(1);
+        if (name !== null) dict[name] = val;
+      } else {
+        parseValue(1);
+        if (i >= LIMIT) break;
+      }
+    }
+    return dict;
+  }
+  function enrichDict(d) {
+    if (!d || typeof d !== 'object') return d;
+    for (const [k, v] of Object.entries(d)) {
+      if (Array.isArray(v)) {
+        for (let i = 0; i < v.length; i++) {
+          if ((typeof v[i] === 'string' || typeof v[i] === 'number') && v[i + 1] === 0 && v[i + 2] === 'R') {
+            v[i] = { __num: String(v[i]) };
+            v.splice(i + 1, 2);
+          }
+          if (v[i] && typeof v[i] === 'object') enrichDict(v[i]);
+        }
+      } else if (v && typeof v === 'object') enrichDict(v);
+    }
+    return d;
+  }
+  const resolveRef = (v) => {
+    if (v && typeof v === 'object') {
+      if (v.__num) return objs.get(parseInt(v.__num, 10)) || null;
+      return null;
+    }
+    if (v !== undefined && v !== null && (typeof v === 'string' || typeof v === 'number') && /^\d+$/.test(String(v))) return objs.get(parseInt(v, 10)) || null;
+    return null;
+  };
+  function streamData(o) {
+    const sIdx = o.raw.indexOf('stream');
+    if (sIdx < 0) return null;
+    let start = sIdx + 6;
+    if (o.raw[start] === '\r') start++;
+    if (o.raw[start] === '\n') start++;
+    const eIdx = o.raw.lastIndexOf('endstream');
+    if (eIdx < 0) return null;
+    let end = eIdx;
+    while (end > start && (o.raw[end - 1] === '\n' || o.raw[end - 1] === '\r' || o.raw[end - 1] === ' ')) end--;
+    let data = Buffer.from(o.raw.slice(start, end), 'latin1');
+    const d = enrichDict(parseDict(objBody(o).slice(0, sIdx), 0));
+    if (d.Filter === 'FlateDecode' || (Array.isArray(d.Filter) && d.Filter[0] === 'FlateDecode')) {
+      try { data = zlib.inflateSync(data); } catch { /* 保持原样 */ }
+    }
+    return { data, dict: d };
+  }
+  function buildToUnicode(mapObj) {
+    const so = resolveRef(mapObj);
+    if (!so) return null;
+    const sd = streamData(so);
+    if (!sd || !sd.data) return null;
+    const text = sd.data.toString('latin1');
+    const out = {};
+    let m;
+    const bf = /beginbfchar([\s\S]*?)endbfchar/g;
+    while ((m = bf.exec(text)) !== null) {
+      const pairs = m[1].match(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g) || [];
+      for (const p of pairs) {
+        const pm = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/.exec(p);
+        if (pm) out[pm[1].toLowerCase()] = String.fromCodePoint(parseInt(pm[2], 16));
+      }
+    }
+    const br = /beginbfrange([\s\S]*?)endbfrange/g;
+    while ((m = br.exec(text)) !== null) {
+      const lines = m[1].match(/<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g) || [];
+      for (const l of lines) {
+        const lm = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/.exec(l);
+        if (lm) {
+          const a = parseInt(lm[1], 16), b = parseInt(lm[2], 16), c = parseInt(lm[3], 16);
+          for (let k = a; k <= b && k - a < 512; k++) out[k.toString(16)] = String.fromCodePoint(c + (k - a));
+        }
+      }
+    }
+    return out;
+  }
+  function decodeTextString(str, font) {
+    let b;
+    if (str && typeof str === 'object' && str.__hex) {
+      let h = str.__hex;
+      if (h.length % 2) h = '0' + h;
+      b = Buffer.from(h, 'hex');
+    } else if (typeof str === 'string') {
+      b = Buffer.from(str, 'latin1');
+    } else return '';
+    const tu = font && font.toUnicode;
+    if (tu) {
+      let out = '';
+      let hits = 0;
+      for (let i = 0; i + 1 < b.length; i += 2) {
+        const key = ((b[i] << 8) | b[i + 1]).toString(16);
+        const ch = tu[key];
+        if (ch !== undefined) { out += ch; hits++; }
+      }
+      if (hits === 0 && b.length >= 1) {
+        for (let i = 0; i < b.length; i++) {
+          const ch = tu[b[i].toString(16)];
+          if (ch !== undefined) { out += ch; hits++; }
+        }
+      }
+      if (hits > 0) return out;
+    }
+    const encName = font && typeof font.encoding === 'string' ? font.encoding : '';
+    const isType0 = font && font.subtype === 'Type0';
+    if ((encName === 'UniGB-UCS2-H' || isType0) && b.length >= 2 && b.length % 2 === 0) {
+      let be = '';
+      for (let i = 0; i < b.length; i += 2) be += String.fromCharCode((b[i] << 8) | b[i + 1]);
+      const printable = [...be].filter(c => c.charCodeAt(0) > 31).length;
+      if (printable >= be.length * 0.7) return be;
+    }
+    return b.toString('latin1');
+  }
+  // 页面树
+  let pagesRef = null;
+  const tm = /\/Root\s+(\d+)\s+\d+\s+R/.exec(ascii);
+  if (tm) {
+    const rootObj = objs.get(parseInt(tm[1], 10));
+    if (rootObj) {
+      const m2 = /\/Pages\s+(\d+)\s+\d+\s+R/.exec(rootObj.raw);
+      if (m2) pagesRef = m2[1];
+    }
+  }
+  const getPagesTree = (refNum, acc) => {
+    const o = objs.get(parseInt(refNum, 10));
+    if (!o) return acc;
+    const d = enrichDict(parseDict(objBody(o), 0));
+    if (d.Type === 'Pages') {
+      const kids = Array.isArray(d.Kids) ? d.Kids : [d.Kids];
+      for (const k of kids) {
+        const ko = resolveRef(k);
+        if (ko) {
+          const kd = enrichDict(parseDict(objBody(ko), 0));
+          if (kd.Type === 'Pages') getPagesTree(ko.num, acc);
+          else if (kd.Type === 'Page') acc.push({ num: ko.num, dict: kd });
+        }
+      }
+    } else if (d.Type === 'Page') {
+      acc.push({ num: o.num, dict: d });
+    }
+    return acc;
+  };
+  return { objs, objBody, parseDict, enrichDict, resolveRef, streamData, buildToUnicode, decodeTextString, getPages: () => (pagesRef ? getPagesTree(pagesRef, []) : []), ascii };
+}
+
+// 扫描字体: 名称/子类型/编码/是否内嵌
+function scanFonts(pdf) {
+  const fonts = [];
+  for (const o of pdf.objs.values()) {
+    let d;
+    try { d = pdf.enrichDict(pdf.parseDict(pdf.objBody(o), 0)); } catch { continue; }
+    if (d.Type !== 'Font') continue;
+    let embedded = false;
+    const checkDesc = (descRef) => {
+      const descObj = pdf.resolveRef(descRef);
+      if (!descObj) return;
+      const dd = pdf.enrichDict(pdf.parseDict(pdf.objBody(descObj), 0));
+      embedded = embedded || !!dd.FontFile || !!dd.FontFile2 || !!dd.FontFile3;
+    };
+    if (d.FontDescriptor) checkDesc(d.FontDescriptor);
+    if (Array.isArray(d.DescendantFonts)) {
+      for (const df of d.DescendantFonts) {
+        const dfo = pdf.resolveRef(df);
+        if (!dfo) continue;
+        const dfd = pdf.enrichDict(pdf.parseDict(pdf.objBody(dfo), 0));
+        if (dfd.FontDescriptor) checkDesc(dfd.FontDescriptor);
+      }
+    }
+    fonts.push({
+      name: d.BaseFont || '?',
+      subtype: d.Subtype || '?',
+      encoding: typeof d.Encoding === 'string' ? d.Encoding : '?',
+      embedded
+    });
+  }
+  return fonts;
+}
+
+// ---------- pdfjs 文档加载 ----------
+async function loadDoc(buf) {
+  return await pdfjs.getDocument({
+    data: new Uint8Array(buf),
+    isEvalSupported: false,
+    verbosity: 0,
+    useSystemFonts: true,
+    cMapUrl: CMAPS_DIR,
+    cMapPacked: true,
+    CMapReaderFactory: FsCMapReaderFactory,
+    standardFontDataUrl: STDFONTS_DIR,
+    StandardFontDataFactory: FsStandardFontDataFactory,
+    canvasFactory: new NodeCanvasFactory(),
+  }).promise;
+}
+
+// ---------- 对外功能 ----------
+export async function pdfInfo(file) {
+  const buf = fs.readFileSync(file);
+  const pdf = parsePdfObjects(buf);
+  const doc = await loadDoc(buf);
+  try {
+    const pages = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+      const page = await doc.getPage(i);
+      const vp = page.getViewport({ scale: 1 });
+      pages.push({ num: i, width: Math.round(vp.width * 100) / 100, height: Math.round(vp.height * 100) / 100 });
+    }
+    const meta = await doc.getMetadata();
+    const info = meta.info || {};
+    return {
+      pageCount: doc.numPages,
+      pages,
+      metadata: {
+        title: info.Title || null,
+        author: info.Author || null,
+        subject: info.Subject || null,
+        creator: info.Creator || null,
+        producer: info.Producer || null,
+        creationDate: info.CreationDate || null,
+        modDate: info.ModDate || null
+      },
+      fonts: scanFonts(pdf)
+    };
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// 行分组: 把带坐标的文本行按 y 聚合为阅读行
+function groupRows(lines, withPosition) {
+  lines.sort((a, b) => b.y - a.y || a.x - b.x);
+  const rows = [];
+  let lastY = null;
+  let row = [];
+  const flush = () => {
+    if (row.length) {
+      row.sort((a, b) => a.x - b.x);
+      rows.push({ y: row[0].y, text: row.map(r => r.text).join(' '), lines: row });
+      row = [];
+    }
+  };
+  for (const l of lines) {
+    if (lastY !== null && Math.abs(l.y - lastY) > Math.max(l.size, 6) * 0.6) flush();
+    row.push(l);
+    lastY = l.y;
+  }
+  flush();
+  return { text: rows.map(r => r.text).join('\n'), ...withPosition ? { rows } : {} };
+}
+
+// pdfjs 文字提取 (内嵌字体 PDF 首选)
+async function extractTextPdfjs(buf, page, withPosition) {
+  const doc = await loadDoc(buf);
+  try {
+    const targets = page ? [page] : Array.from({ length: doc.numPages }, (_, i) => i + 1);
+    const pages = [];
+    for (const p of targets) {
+      const pdfPage = await doc.getPage(p);
+      const content = await pdfPage.getTextContent();
+      const lines = [];
+      for (const item of content.items) {
+        if (!item.str) continue;
+        const x = item.transform[4];
+        const y = item.transform[5];
+        lines.push({ text: item.str, x: Math.round(x * 100) / 100, y: Math.round(y * 100) / 100, size: Math.round(item.height * 100) / 100 });
+      }
+      pages.push({ num: p, ...groupRows(lines, withPosition) });
+    }
+    return { pages };
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// 自研内容流文字提取 (未内嵌字体 PDF 用; pdfjs 会把这类文件的 CJK 文本解成空串)
+function extractTextOwn(buf, page = null, withPosition = false) {
+  const pdf = parsePdfObjects(buf);
+  const pages = pdf.getPages();
+  if (!pages.length) throw new Error('no pages found (unsupported page tree)');
+  const targets = page ? pages.filter(p => pages.indexOf(p) + 1 === page) : pages;
+  const out = [];
+  for (const pg of targets) {
+    const pd = pg.dict;
+    let resources = pd.Resources;
+    if (resources !== undefined && resources !== null && typeof resources !== 'object') {
+      const ro = pdf.resolveRef(resources);
+      if (ro) resources = pdf.enrichDict(pdf.parseDict(pdf.objBody(ro), 0));
+    }
+    const fonts = {};
+    if (resources && resources.Font) {
+      for (const [name, ref] of Object.entries(resources.Font)) {
+        const fo = pdf.resolveRef(ref);
+        if (!fo) continue;
+        const fd = pdf.enrichDict(pdf.parseDict(pdf.objBody(fo), 0));
+        fonts[name] = {
+          baseFont: fd.BaseFont,
+          encoding: fd.Encoding,
+          subtype: fd.Subtype,
+          toUnicode: fd.ToUnicode ? pdf.buildToUnicode(fd.ToUnicode) : null
+        };
+      }
+    }
+    const contentList = Array.isArray(pd.Contents) ? pd.Contents : [pd.Contents];
+    const lines = [];
+    for (const cRef of contentList) {
+      const co = pdf.resolveRef(cRef);
+      if (!co) continue;
+      const sd = pdf.streamData(co);
+      if (!sd || !sd.data) continue;
+      const content = sd.data.toString('latin1');
+      let s = 0;
+      let gstate = { font: null, size: 12, tlm: [0, 0] };
+      let x = null, y = null;
+      while (s < content.length) {
+        const bt = content.indexOf('BT', s);
+        if (bt < 0) break;
+        const et = content.indexOf('ET', bt + 2);
+        if (et < 0) break;
+        const block = content.slice(bt + 2, et);
+        const tokens = block.trim().split(/\s+/);
+        let i2 = 0;
+        while (i2 < tokens.length) {
+          const t = tokens[i2];
+          if (t === 'Tf') {
+            const fn = tokens[i2 - 2];
+            if (fn && fn.startsWith('/')) gstate.font = fonts[fn.slice(1)] || null;
+            const sz = parseFloat(tokens[i2 - 1]);
+            if (Number.isFinite(sz)) gstate.size = sz;
+          } else if (t === 'Tm') {
+            const a = tokens.slice(i2 - 6, i2).map(parseFloat);
+            if (a.length === 6 && a.every(Number.isFinite)) {
+              x = a[4]; y = a[5];
+              gstate.tlm = [a[4], a[5]];
+            }
+          } else if (t === 'Td' || t === 'TD') {
+            const dx = parseFloat(tokens[i2 - 2]), dy = parseFloat(tokens[i2 - 1]);
+            if (Number.isFinite(dx) && Number.isFinite(dy)) {
+              gstate.tlm[0] += dx; gstate.tlm[1] += dy; x = gstate.tlm[0]; y = gstate.tlm[1];
+            }
+          } else if (t === 'T*') {
+            gstate.tlm[1] -= gstate.size * 1.2; x = gstate.tlm[0]; y = gstate.tlm[1];
+          } else if (t === 'Tj') {
+            const arg = tokens[i2 - 1];
+            if (arg && (arg.startsWith('(') || arg.startsWith('<'))) {
+              const txt = pdf.decodeTextString(arg.startsWith('<') ? { __hex: arg.slice(1, -1) } : arg.slice(1, -1), gstate.font || {});
+              if (txt && x !== null) lines.push({ x, y, size: gstate.size, text: txt });
+            }
+          } else if (t === 'TJ') {
+            let parts = [];
+            for (let k = i2 - 1; k >= 0; k--) {
+              parts.unshift(tokens[k]);
+              if (tokens[k].includes('[')) break;
+            }
+            const joined = parts.join(' ');
+            const arrIdx = joined.indexOf('[');
+            if (arrIdx >= 0) {
+              const arrStr = joined.slice(arrIdx + 1, joined.lastIndexOf(']') >= 0 ? joined.lastIndexOf(']') : joined.length);
+              let outText = '';
+              const pm = arrStr.match(/\((?:\\.|[^)])*\)|<[0-9a-fA-F]*>|-\d+(?:\.\d+)?/g) || [];
+              for (const p of pm) {
+                if (p.startsWith('(')) outText += pdf.decodeTextString(p.slice(1, -1), gstate.font || {});
+                else if (p.startsWith('<')) outText += pdf.decodeTextString({ __hex: p.slice(1, -1) }, gstate.font || {});
+              }
+              if (outText && x !== null) lines.push({ x, y, size: gstate.size, text: outText });
+            }
+          }
+          i2++;
+        }
+        s = et + 2;
+      }
+    }
+    const num = pages.indexOf(pg) + 1;
+    out.push({ num, ...groupRows(lines, withPosition) });
+  }
+  return { pages: out };
+}
+
+// 提取入口: 字体全内嵌走 pdfjs, 否则走自研解析器
+export async function extractText(file, { page = null, withPosition = false } = {}) {
+  const buf = fs.readFileSync(file);
+  const pdf = parsePdfObjects(buf);
+  const fonts = scanFonts(pdf);
+  const embeddedAll = fonts.length > 0 && fonts.every(f => f.embedded);
+  return embeddedAll
+    ? await extractTextPdfjs(buf, page, withPosition)
+    : extractTextOwn(buf, page, withPosition);
+}
+
+// pdfjs 引擎渲染
+async function renderPdfjs(buf, pageNum, scale, W, H) {
+  const doc = await loadDoc(buf);
+  try {
+    const page = await doc.getPage(pageNum);
+    const viewport = page.getViewport({ scale });
+    const factory = new NodeCanvasFactory();
+    const { canvas, context } = factory.create(Math.round(viewport.width), Math.round(viewport.height));
+    await page.render({ canvasContext: context, viewport, canvasFactory: factory }).promise;
+    const png = canvas.toBuffer('image/png');
+    const { width, height } = canvas;
+    factory.destroy({ canvas, context });
+    return { png, width, height };
+  } finally {
+    await doc.destroy();
+  }
+}
+
+// sysfont 引擎渲染 (自研内容流渲染 + 系统字体文字)
+function renderSysfont(buf, pageNum, scale) {
+  const pdf = parsePdfObjects(buf);
+  const pages = pdf.getPages();
+  const page = pages[pageNum - 1];
+  if (!page) throw new Error(`page ${pageNum} not found`);
+  const pd = page.dict;
+  const mb = Array.isArray(pd.MediaBox) ? pd.MediaBox : [0, 0, 1198.4, 848.4];
+  const W = mb[2], H = mb[3];
+  const canvas = createCanvas(Math.round(W * scale), Math.round(H * scale));
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  let resources = pd.Resources;
+  if (resources !== undefined && resources !== null && typeof resources !== 'object') {
+    const ro = pdf.resolveRef(resources);
+    if (ro) resources = pdf.enrichDict(pdf.parseDict(pdf.objBody(ro), 0));
+  }
+  const fonts = {};
+  if (resources && resources.Font) {
+    for (const [name, ref] of Object.entries(resources.Font)) {
+      const fo = pdf.resolveRef(ref);
+      if (!fo) continue;
+      const fd = pdf.enrichDict(pdf.parseDict(pdf.objBody(fo), 0));
+      fonts[name] = { baseFont: fd.BaseFont, encoding: fd.Encoding, subtype: fd.Subtype, toUnicode: fd.ToUnicode ? pdf.buildToUnicode(fd.ToUnicode) : null, family: pdfFontToFamily(fd.BaseFont) };
+    }
+  }
+
+  const color2style = (c) => `rgb(${Math.round(c[0] * 255)},${Math.round(c[1] * 255)},${Math.round(c[2] * 255)})`;
+  const drawText = (text, x, y, size, family, fillC) => {
+    ctx.save();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    ctx.fillStyle = color2style(fillC);
+    const px = size * scale;
+    ctx.font = `${px}px "${family}", "Arial", sans-serif`;
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(text, x * scale, (H - y) * scale);
+    ctx.restore();
+  };
+
+  ctx.setTransform(scale, 0, 0, -scale, 0, H * scale);
+  ctx.lineWidth = 1 / 30;
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+  let fillC = [0, 0, 0], strokeC = [0, 0, 0];
+  ctx.fillStyle = color2style(fillC);
+  ctx.strokeStyle = color2style(strokeC);
+  let inText = false;
+  let tFont = null, tSize = 12;
+  let tX = 0, tY = 0, tLine = [0, 0];
+  let skipImg = false;
+
+  const contentList = Array.isArray(pd.Contents) ? pd.Contents : [pd.Contents];
+  for (const cRef of contentList) {
+    const co = pdf.resolveRef(cRef);
+    if (!co) continue;
+    const sd = pdf.streamData(co);
+    if (!sd || !sd.data) continue;
+    const tokens = sd.data.toString('latin1').trim().split(/\s+/);
+    let i = 0;
+    const num = (n) => parseFloat(tokens[i + n]);
+    while (i < tokens.length) {
+      const t = tokens[i];
+      if (skipImg) {
+        if (t === 'EI') skipImg = false;
+        i++;
+        continue;
+      }
+      if (inText) {
+        if (t === 'ET') { inText = false; i++; continue; }
+        if (t === 'Tf') {
+          const fn = tokens[i - 2];
+          if (fn && fn.startsWith('/')) tFont = fonts[fn.slice(1)] || null;
+          const sz = parseFloat(tokens[i - 1]);
+          if (Number.isFinite(sz)) tSize = sz;
+        } else if (t === 'Tm') {
+          const a = [num(-6), num(-5), num(-4), num(-3), num(-2), num(-1)];
+          if (a.every(Number.isFinite)) { tX = a[4]; tY = a[5]; tLine = [a[4], a[5]]; }
+        } else if (t === 'Td' || t === 'TD') {
+          const dx = num(-2), dy = num(-1);
+          if (Number.isFinite(dx) && Number.isFinite(dy)) { tLine[0] += dx; tLine[1] += dy; tX = tLine[0]; tY = tLine[1]; }
+        } else if (t === 'T*') {
+          tLine[1] -= tSize * 1.2; tX = tLine[0]; tY = tLine[1];
+        } else if (t === 'Tj') {
+          const arg = tokens[i - 1];
+          if (arg && (arg.startsWith('(') || arg.startsWith('<'))) {
+            const txt = pdf.decodeTextString(arg.startsWith('<') ? { __hex: arg.slice(1, -1) } : arg.slice(1, -1), tFont || {});
+            if (txt) drawText(txt, tX, tY, tSize, tFont ? tFont.family : 'Arial', fillC);
+          }
+        } else if (t === 'TJ') {
+          let parts = [];
+          for (let k = i - 1; k >= 0; k--) {
+            parts.unshift(tokens[k]);
+            if (tokens[k].includes('[')) break;
+          }
+          const joined = parts.join(' ');
+          const a0 = joined.indexOf('[');
+          if (a0 >= 0) {
+            const a1 = joined.lastIndexOf(']');
+            const arrStr = joined.slice(a0 + 1, a1 >= 0 ? a1 : joined.length);
+            let out = '';
+            const pm = arrStr.match(/\((?:\\.|[^)])*\)|<[0-9a-fA-F]*>|-\d+(?:\.\d+)?/g) || [];
+            for (const p of pm) {
+              if (p.startsWith('(')) out += pdf.decodeTextString(p.slice(1, -1), tFont || {});
+              else if (p.startsWith('<')) out += pdf.decodeTextString({ __hex: p.slice(1, -1) }, tFont || {});
+            }
+            if (out) drawText(out, tX, tY, tSize, tFont ? tFont.family : 'Arial', fillC);
+          }
+        }
+        i++;
+        continue;
+      }
+      switch (t) {
+        case 'BT': inText = true; break;
+        case 'BI': skipImg = true; break;
+        case 'q': ctx.save(); break;
+        case 'Q': ctx.restore(); break;
+        case 'cm': {
+          const a = [num(-6), num(-5), num(-4), num(-3), num(-2), num(-1)];
+          if (a.every(Number.isFinite)) ctx.transform(a[0], a[1], a[2], a[3], a[4], a[5]);
+          break;
+        }
+        case 'w': { const w = num(-1); if (Number.isFinite(w) && w >= 0) ctx.lineWidth = w; break; }
+        case 'G': { const g = num(-1); if (Number.isFinite(g)) { strokeC = [g, g, g]; ctx.strokeStyle = color2style(strokeC); } break; }
+        case 'g': { const g = num(-1); if (Number.isFinite(g)) { fillC = [g, g, g]; ctx.fillStyle = color2style(fillC); } break; }
+        case 'RG': { const c = [num(-3), num(-2), num(-1)]; if (c.every(Number.isFinite)) { strokeC = c; ctx.strokeStyle = color2style(c); } break; }
+        case 'rg': { const c = [num(-3), num(-2), num(-1)]; if (c.every(Number.isFinite)) { fillC = c; ctx.fillStyle = color2style(c); } break; }
+        case 'm': { const x = num(-2), y = num(-1); if (Number.isFinite(x)) ctx.moveTo(x, y); break; }
+        case 'l': { const x = num(-2), y = num(-1); if (Number.isFinite(x)) ctx.lineTo(x, y); break; }
+        case 'c': {
+          const a = [num(-6), num(-5), num(-4), num(-3), num(-2), num(-1)];
+          if (a.every(Number.isFinite)) ctx.bezierCurveTo(a[0], a[1], a[2], a[3], a[4], a[5]);
+          break;
+        }
+        case 'v': { const a = [num(-4), num(-3), num(-2), num(-1)]; if (a.every(Number.isFinite)) ctx.quadraticCurveTo(a[0], a[1], a[2], a[3]); break; }
+        case 'y': { const a = [num(-4), num(-3), num(-2), num(-1)]; if (a.every(Number.isFinite)) ctx.quadraticCurveTo(a[0], a[1], a[2], a[3]); break; }
+        case 'h': ctx.closePath(); break;
+        case 're': {
+          const a = [num(-4), num(-3), num(-2), num(-1)];
+          if (a.every(Number.isFinite)) ctx.rect(a[0], a[1], a[2], a[3]);
+          break;
+        }
+        case 'S': ctx.stroke(); break;
+        case 's': ctx.closePath(); ctx.stroke(); break;
+        case 'f': case 'F': ctx.fill(); break;
+        case 'f*': ctx.fill('evenodd'); break;
+        case 'B': case 'B*': ctx.fill(); ctx.stroke(); break;
+        case 'n': ctx.beginPath(); break;
+        case 'W': ctx.clip(); break;
+        case 'W*': ctx.clip('evenodd'); break;
+        default: break;
+      }
+      i++;
+    }
+  }
+  return { png: canvas.toBuffer('image/png'), width: canvas.width, height: canvas.height };
+}
+
+// 渲染入口: 自动选择引擎
+export async function renderPage(file, { page = 1, scale = 2, outDir = null, engine = 'auto' } = {}) {
+  const buf = fs.readFileSync(file);
+  const fonts = scanFonts(parsePdfObjects(buf));
+  const embeddedAll = fonts.length > 0 && fonts.every(f => f.embedded);
+  let useEngine = engine;
+  if (useEngine === 'auto') useEngine = embeddedAll ? 'pdfjs' : 'sysfont';
+  const { png, width, height } = useEngine === 'pdfjs' ? await renderPdfjs(buf, page, scale) : renderSysfont(buf, page, scale);
+
+  const base = path.basename(file, path.extname(file));
+  const dir = outDir ? path.resolve(outDir) : path.join(path.dirname(file), base + '-pages');
+  fs.mkdirSync(dir, { recursive: true });
+  const outPath = path.join(dir, `page-${page}.png`);
+  fs.writeFileSync(outPath, png);
+  return { page, path: outPath, width, height, engine: useEngine };
+}
+
+export { REGISTERED, parsePdfObjects, scanFonts };
